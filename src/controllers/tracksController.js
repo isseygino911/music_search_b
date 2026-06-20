@@ -264,4 +264,38 @@ async function bulkUploadTracks(req, res) {
   });
 }
 
-module.exports = { uploadTrack, getAllTracks, searchTracks, downloadTrack, deleteTrack, bulkDeleteTracks, bulkUploadTracks };
+async function streamTrack(req, res) {
+  const trackId = Number(req.params.id);
+  const [rows] = await pool.query('SELECT s3_key FROM tracks WHERE id = ?', [trackId]);
+  if (!rows.length) return res.status(404).json({ error: 'Track not found' });
+
+  const command = new GetObjectCommand({ Bucket: BUCKET, Key: rows[0].s3_key });
+  const url = await getSignedUrl(s3, command, { expiresIn: 3600 });
+  res.json({ url });
+}
+
+async function updateTrack(req, res) {
+  const trackId = Number(req.params.id);
+  const { title, artist, genre, description } = req.body;
+
+  if (!title || !artist) {
+    return res.status(400).json({ error: 'Title and artist are required' });
+  }
+
+  const [result] = await pool.query(
+    'UPDATE tracks SET title=?, artist=?, genre=?, description=? WHERE id=?',
+    [title, artist, genre || '', description || null, trackId]
+  );
+
+  if (result.affectedRows === 0) {
+    return res.status(404).json({ error: 'Track not found' });
+  }
+
+  const [rows] = await pool.query(
+    'SELECT id, title, artist, genre, description, duration, file_size, mime_type, uploaded_at FROM tracks WHERE id = ?',
+    [trackId]
+  );
+  res.json(rows[0]);
+}
+
+module.exports = { uploadTrack, getAllTracks, searchTracks, downloadTrack, streamTrack, deleteTrack, bulkDeleteTracks, bulkUploadTracks, updateTrack };
