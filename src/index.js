@@ -13,7 +13,11 @@ const usersRoutes = require('./routes/users');
 const app = express();
 
 app.use(helmet());
-app.use(cors({ origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173', credentials: true }));
+const allowedOrigins = ['http://localhost:5173', 'https://isseylab.com, https://api.isseylab.com'];
+app.use(cors({
+  origin: (origin, cb) => cb(null, !origin || allowedOrigins.includes(origin)),
+  credentials: true,
+}));
 app.use(express.json());
 
 // Rate limit auth endpoints to prevent brute force
