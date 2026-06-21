@@ -2,7 +2,7 @@ const { Router } = require('express');
 const { verifyToken } = require('../middleware/auth');
 const { adminOnly } = require('../middleware/adminOnly');
 const {
-  uploadTrack, getAllTracks, searchTracks, downloadTrack, streamTrack,
+  uploadTrack, getAllTracks, searchTracks, downloadTrack, getDownloadUrl, streamTrack,
   deleteTrack, bulkDeleteTracks, bulkUploadTracks, updateTrack,
 } = require('../controllers/tracksController');
 
@@ -13,6 +13,7 @@ router.get('/search', verifyToken, searchTracks);
 router.get('/', verifyToken, getAllTracks);
 router.get('/:id/stream', verifyToken, streamTrack);
 router.get('/:id/download', verifyToken, downloadTrack);
+router.get('/:id/download-url', verifyToken, getDownloadUrl);
 
 // Admin-only routes
 router.post('/bulk', verifyToken, adminOnly, bulkUploadTracks);

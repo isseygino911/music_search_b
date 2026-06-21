@@ -218,13 +218,23 @@ async function bulkUploadTracks(req, res) {
       return res.status(400).json({ error: 'Artist is required' });
     }
 
+    // Stream progress back to client via SSE
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    const send = (event, data) => {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
     const mm = await import('music-metadata');
     const results = [];
+    const total = req.files.length;
 
-    // Process files one at a time to avoid memory spikes
-    for (const file of req.files) {
+    for (let i = 0; i < total; i++) {
+      const file = req.files[i];
       const filename = file.originalname;
-      // Use filename (without extension) as title fallback
       const title = path.basename(filename, path.extname(filename));
 
       try {
@@ -254,14 +264,41 @@ async function bulkUploadTracks(req, res) {
 
         const [trackRows] = await pool.query('SELECT * FROM tracks WHERE id = ?', [result.insertId]);
         results.push({ success: true, filename, track: trackRows[0] });
+        send('progress', { index: i + 1, total, filename, success: true });
       } catch (fileErr) {
         results.push({ success: false, filename, error: fileErr.message });
+        send('progress', { index: i + 1, total, filename, success: false, error: fileErr.message });
       }
     }
 
     const uploadedCount = results.filter((r) => r.success).length;
-    res.status(207).json({ results, uploaded: uploadedCount, failed: results.length - uploadedCount });
+    send('done', { results, uploaded: uploadedCount, failed: total - uploadedCount });
+    res.end();
   });
+}
+
+async function getDownloadUrl(req, res) {
+  const trackId = Number(req.params.id);
+  const [rows] = await pool.query('SELECT id, title, mime_type, s3_key FROM tracks WHERE id = ?', [trackId]);
+  if (!rows.length) return res.status(404).json({ error: 'Track not found' });
+
+  const track = rows[0];
+
+  await pool.query('INSERT INTO downloads (user_id, track_id) VALUES (?, ?)', [req.user.userId, trackId]);
+
+  const ext = track.mime_type === 'audio/mpeg' ? '.mp3'
+    : track.mime_type === 'audio/wav' ? '.wav'
+    : track.mime_type === 'audio/flac' ? '.flac'
+    : '.mp3';
+
+  const command = new GetObjectCommand({
+    Bucket: BUCKET,
+    Key: track.s3_key,
+    ResponseContentDisposition: `attachment; filename="${track.title}${ext}"`,
+  });
+
+  const url = await getSignedUrl(s3, command, { expiresIn: 300 });
+  res.json({ url });
 }
 
 async function streamTrack(req, res) {
@@ -298,4 +335,4 @@ async function updateTrack(req, res) {
   res.json(rows[0]);
 }
 
-module.exports = { uploadTrack, getAllTracks, searchTracks, downloadTrack, streamTrack, deleteTrack, bulkDeleteTracks, bulkUploadTracks, updateTrack };
+module.exports = { uploadTrack, getAllTracks, searchTracks, downloadTrack, getDownloadUrl, streamTrack, deleteTrack, bulkDeleteTracks, bulkUploadTracks, updateTrack };
