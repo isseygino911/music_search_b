@@ -12,6 +12,7 @@ const usersRoutes = require('./routes/users');
 
 const app = express();
 
+app.set('trust proxy', 1);
 app.use(helmet());
 const allowedOrigins = ['http://localhost:5173', 'https://isseylab.com', 'https://api.isseylab.com'];
 app.use(cors({
