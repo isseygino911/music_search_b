@@ -1,4 +1,5 @@
 const multer = require('multer');
+const logger = require('../services/logger');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const { PutObjectCommand, GetObjectCommand, DeleteObjectCommand, DeleteObjectsCommand } = require('@aws-sdk/client-s3');
@@ -20,55 +21,7 @@ const multerConfig = multer({
   },
 });
 
-const upload = multerConfig.single('audioFile');
 const uploadMany = multerConfig.array('audioFiles', 50); // up to 50 files
-
-async function uploadTrack(req, res) {
-  upload(req, res, async (err) => {
-    if (err) {
-      return res.status(400).json({ error: err.message });
-    }
-    if (!req.file) {
-      return res.status(400).json({ error: 'No audio file provided' });
-    }
-
-    const { title, artist, genre, description } = req.body;
-    if (!title || !artist) {
-      return res.status(400).json({ error: 'Title and artist are required' });
-    }
-
-    // Extract duration from audio buffer (music-metadata v11 is ESM-only, use dynamic import)
-    let duration = null;
-    try {
-      const mm = await import('music-metadata');
-      const metadata = await mm.parseBuffer(req.file.buffer, { mimeType: req.file.mimetype });
-      duration = metadata.format.duration ? Math.round(metadata.format.duration) : null;
-    } catch {
-      // Duration extraction failed — continue without it
-    }
-
-    // Upload to S3
-    const ext = path.extname(req.file.originalname) || '.mp3';
-    const s3Key = `uploads/${uuidv4()}${ext}`;
-
-    await s3.send(new PutObjectCommand({
-      Bucket: BUCKET,
-      Key: s3Key,
-      Body: req.file.buffer,
-      ContentType: req.file.mimetype,
-    }));
-
-    // Insert into DB
-    const [result] = await pool.query(
-      `INSERT INTO tracks (title, artist, genre, description, duration, s3_key, file_size, mime_type, uploaded_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [title, artist, genre || '', description || null, duration, s3Key, req.file.size, req.file.mimetype, req.user.userId]
-    );
-
-    const [rows] = await pool.query('SELECT * FROM tracks WHERE id = ?', [result.insertId]);
-    res.status(201).json(rows[0]);
-  });
-}
 
 async function getAllTracks(_req, res) {
   const [rows] = await pool.query(
@@ -265,6 +218,18 @@ async function bulkUploadTracks(req, res) {
         const [trackRows] = await pool.query('SELECT * FROM tracks WHERE id = ?', [result.insertId]);
         results.push({ success: true, filename, track: trackRows[0] });
         send('progress', { index: i + 1, total, filename, success: true });
+
+        // Fire-and-forget: Gemini listens to audio → save description → embed → Qdrant
+        const { analyzeAudio, embedText } = require('../services/gemini');
+        const { upsertVector } = require('../services/qdrant');
+        const trackId = result.insertId;
+        analyzeAudio(file.buffer, file.mimetype)
+          .then(async (desc) => {
+            await pool.query('UPDATE tracks SET description = ? WHERE id = ?', [desc, trackId]);
+            const vector = await embedText(desc);
+            await upsertVector(trackId, vector);
+          })
+          .catch((err) => logger.warn('tracks/embed', `Qdrant embed failed for track ${trackId}`, err));
       } catch (fileErr) {
         results.push({ success: false, filename, error: fileErr.message });
         send('progress', { index: i + 1, total, filename, success: false, error: fileErr.message });
@@ -332,7 +297,63 @@ async function updateTrack(req, res) {
     'SELECT id, title, artist, genre, description, duration, file_size, mime_type, uploaded_at FROM tracks WHERE id = ?',
     [trackId]
   );
+
+  // Fire-and-forget: re-embed if description was updated
+  if (description) {
+    const { embedText } = require('../services/gemini');
+    const { upsertVector } = require('../services/qdrant');
+    embedText(description)
+      .then((vector) => upsertVector(trackId, vector))
+      .catch((err) => logger.warn('tracks/re-embed', `Qdrant re-embed failed for track ${trackId}`, err));
+  }
+
   res.json(rows[0]);
 }
 
-module.exports = { uploadTrack, getAllTracks, searchTracks, downloadTrack, getDownloadUrl, streamTrack, deleteTrack, bulkDeleteTracks, bulkUploadTracks, updateTrack };
+async function syncQdrant(_req, res) {
+  const { analyzeAudio, embedText } = require('../services/gemini');
+  const { upsertVector } = require('../services/qdrant');
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const send = (event, data) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+
+  const [tracks] = await pool.query('SELECT id, s3_key, mime_type, description FROM tracks');
+
+  const total = tracks.length;
+  let synced = 0;
+  let failed = 0;
+
+  for (const track of tracks) {
+    try {
+      let desc = track.description;
+      if (!desc) {
+        // No saved description yet — fetch audio from S3 and let Gemini analyze it
+        const { Body } = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: track.s3_key }));
+        const chunks = [];
+        for await (const chunk of Body) chunks.push(chunk);
+        const audioBuffer = Buffer.concat(chunks);
+        desc = await analyzeAudio(audioBuffer, track.mime_type);
+        await pool.query('UPDATE tracks SET description = ? WHERE id = ?', [desc, track.id]);
+      }
+      const vector = await embedText(desc);
+      await upsertVector(track.id, vector);
+      synced++;
+      send('progress', { index: synced + failed, total, trackId: track.id, success: true });
+    } catch (err) {
+      failed++;
+      logger.error('tracks/sync', `failed for track ${track.id}`, err);
+      send('progress', { index: synced + failed, total, trackId: track.id, success: false, error: err.message });
+    }
+  }
+
+  send('done', { synced, failed, total });
+  res.end();
+}
+
+module.exports = { getAllTracks, searchTracks, downloadTrack, getDownloadUrl, streamTrack, deleteTrack, bulkDeleteTracks, bulkUploadTracks, updateTrack, syncQdrant };
