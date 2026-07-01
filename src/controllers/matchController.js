@@ -96,46 +96,42 @@ async function streamMatchJob(req, res) {
 
     send('step', { step: 4, label: 'Finding matching tracks...', status: 'done' });
 
-    // Persist source video to S3 so the editor can load it later.
-    // If this fails we still return the tracks — editor button just won't appear.
-    let videoS3Key = null;
-    try {
-      const ext = mimeType === 'video/quicktime' ? '.mov'
-        : mimeType === 'video/webm' ? '.webm'
-        : mimeType === 'video/avi' ? '.avi'
-        : '.mp4';
-      videoS3Key = `video-uploads/${jobId}${ext}`;
-      console.log('[match] uploading video to S3:', videoS3Key);
-      await s3.send(new PutObjectCommand({
-        Bucket: BUCKET,
-        Key: videoS3Key,
-        Body: videoBuffer,
-        ContentType: mimeType,
-      }));
-      console.log('[match] video S3 upload done');
-    } catch (s3Err) {
-      console.error('[match] video S3 upload failed:', s3Err.message);
-      logger.error('match', 'video S3 upload failed', s3Err);
-      videoS3Key = null;
-    }
+    // Send done immediately so the UI unblocks — S3/DB persist in the background
+    const ext = mimeType === 'video/quicktime' ? '.mov'
+      : mimeType === 'video/webm' ? '.webm'
+      : mimeType === 'video/avi' ? '.avi'
+      : '.mp4';
+    const videoS3Key = `video-uploads/${jobId}${ext}`;
 
-    // Persist the match session so the user never has to re-upload or re-run AI
-    let sessionId = null;
-    try {
-      sessionId = jobId;
-      console.log('[match] saving session to DB, userId:', req.user.userId);
-      await pool.query(
-        'INSERT INTO match_sessions (id, user_id, video_s3_key, matched_tracks) VALUES (?, ?, ?, ?)',
-        [sessionId, req.user.userId, videoS3Key, JSON.stringify(tracks)]
-      );
-      console.log('[match] session saved:', sessionId);
-    } catch (dbErr) {
-      console.error('[match] session save failed:', dbErr.message);
-      logger.error('match', 'session save failed', dbErr);
-      sessionId = null;
-    }
+    send('done', { tracks, videoS3Key, sessionId: jobId });
+    res.end();
 
-    send('done', { tracks, videoS3Key, sessionId });
+    // Background: upload video to S3 then persist match session to DB
+    setImmediate(async () => {
+      let s3Ok = false;
+      try {
+        await s3.send(new PutObjectCommand({
+          Bucket: BUCKET,
+          Key: videoS3Key,
+          Body: videoBuffer,
+          ContentType: mimeType,
+        }));
+        s3Ok = true;
+      } catch (s3Err) {
+        logger.error('match', 'video S3 upload failed', s3Err);
+      }
+
+      try {
+        await pool.query(
+          'INSERT INTO match_sessions (id, user_id, video_s3_key, matched_tracks) VALUES (?, ?, ?, ?)',
+          [jobId, req.user.userId, s3Ok ? videoS3Key : null, JSON.stringify(tracks)]
+        );
+      } catch (dbErr) {
+        logger.error('match', 'session save failed', dbErr);
+      }
+    });
+
+    return; // res already ended
   } catch (err) {
     logger.error('match', 'pipeline failed', err);
     send('error', { error: err.message });
