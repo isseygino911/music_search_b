@@ -15,7 +15,7 @@ async function withRetry(fn, retries = 5, baseDelayMs = 2000) {
   }
 }
 
-const GENERATION_MODELS = ['gemini-2.5-flash-lite', 'gemini-2.0-flash-lite'];
+const GENERATION_MODELS = ['gemini-2.5-flash-lite', 'gemini-2.5-flash'];
 
 async function generateWithFallback(parts) {
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
