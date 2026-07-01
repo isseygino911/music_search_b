@@ -3,6 +3,8 @@ const { v4: uuidv4 } = require('uuid');
 const { analyzeVideo, embedText } = require('../services/gemini');
 const { searchVectors } = require('../services/qdrant');
 const { pool } = require('../config/db');
+const { s3, BUCKET } = require('../config/s3');
+const { PutObjectCommand } = require('@aws-sdk/client-s3');
 const logger = require('../services/logger');
 
 const ALLOWED_VIDEO_MIME = ['video/mp4', 'video/webm', 'video/quicktime', 'video/avi'];
@@ -52,13 +54,16 @@ async function streamMatchJob(req, res) {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
 
+  // Capture buffer before deleting from job store
+  const { videoBuffer, mimeType } = job;
+
   // Clean up job once stream starts so the buffer doesn't linger
   jobs.delete(jobId);
 
   try {
     // Step 1: Upload video to Gemini + wait for it to be ready
     send('step', { step: 1, label: 'Uploading video to AI...', status: 'active' });
-    const description = await analyzeVideo(job.videoBuffer, job.mimeType);
+    const description = await analyzeVideo(videoBuffer, mimeType);
     send('step', { step: 1, label: 'Uploading video to AI...', status: 'done' });
 
     // Step 2: AI analysis is already done inside analyzeVideo
@@ -90,7 +95,47 @@ async function streamMatchJob(req, res) {
     }
 
     send('step', { step: 4, label: 'Finding matching tracks...', status: 'done' });
-    send('done', { tracks });
+
+    // Persist source video to S3 so the editor can load it later.
+    // If this fails we still return the tracks — editor button just won't appear.
+    let videoS3Key = null;
+    try {
+      const ext = mimeType === 'video/quicktime' ? '.mov'
+        : mimeType === 'video/webm' ? '.webm'
+        : mimeType === 'video/avi' ? '.avi'
+        : '.mp4';
+      videoS3Key = `video-uploads/${jobId}${ext}`;
+      console.log('[match] uploading video to S3:', videoS3Key);
+      await s3.send(new PutObjectCommand({
+        Bucket: BUCKET,
+        Key: videoS3Key,
+        Body: videoBuffer,
+        ContentType: mimeType,
+      }));
+      console.log('[match] video S3 upload done');
+    } catch (s3Err) {
+      console.error('[match] video S3 upload failed:', s3Err.message);
+      logger.error('match', 'video S3 upload failed', s3Err);
+      videoS3Key = null;
+    }
+
+    // Persist the match session so the user never has to re-upload or re-run AI
+    let sessionId = null;
+    try {
+      sessionId = jobId;
+      console.log('[match] saving session to DB, userId:', req.user.userId);
+      await pool.query(
+        'INSERT INTO match_sessions (id, user_id, video_s3_key, matched_tracks) VALUES (?, ?, ?, ?)',
+        [sessionId, req.user.userId, videoS3Key, JSON.stringify(tracks)]
+      );
+      console.log('[match] session saved:', sessionId);
+    } catch (dbErr) {
+      console.error('[match] session save failed:', dbErr.message);
+      logger.error('match', 'session save failed', dbErr);
+      sessionId = null;
+    }
+
+    send('done', { tracks, videoS3Key, sessionId });
   } catch (err) {
     logger.error('match', 'pipeline failed', err);
     send('error', { error: err.message });
@@ -99,4 +144,87 @@ async function streamMatchJob(req, res) {
   res.end();
 }
 
-module.exports = { createMatchJob, streamMatchJob };
+async function listMatchSessions(req, res) {
+  const [rows] = await pool.query(
+    `SELECT id, video_s3_key, created_at,
+            JSON_LENGTH(matched_tracks) AS track_count
+     FROM match_sessions
+     WHERE user_id = ?
+     ORDER BY created_at DESC
+     LIMIT 20`,
+    [req.user.userId]
+  );
+  res.json(rows);
+}
+
+async function getMatchSession(req, res) {
+  const [rows] = await pool.query(
+    'SELECT id, video_s3_key, matched_tracks, created_at FROM match_sessions WHERE id = ? AND user_id = ?',
+    [req.params.id, req.user.userId]
+  );
+  if (!rows.length) return res.status(404).json({ error: 'Session not found' });
+
+  const session = rows[0];
+  // matched_tracks may come back as a string or already parsed depending on MySQL driver
+  const tracks = typeof session.matched_tracks === 'string'
+    ? JSON.parse(session.matched_tracks)
+    : session.matched_tracks;
+
+  // Generate a fresh presigned URL for the video if it exists
+  let videoUrl = null;
+  if (session.video_s3_key) {
+    const { GetObjectCommand } = require('@aws-sdk/client-s3');
+    const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+    videoUrl = await getSignedUrl(
+      s3,
+      new GetObjectCommand({ Bucket: BUCKET, Key: session.video_s3_key }),
+      { expiresIn: 3600 }
+    );
+  }
+
+  res.json({ ...session, tracks, videoUrl });
+}
+
+async function deleteMatchSession(req, res) {
+  const [rows] = await pool.query(
+    'SELECT id, user_id, video_s3_key FROM match_sessions WHERE id = ? AND user_id = ?',
+    [req.params.id, req.user.userId]
+  );
+  if (!rows.length) return res.status(404).json({ error: 'Session not found' });
+
+  const session = rows[0];
+
+  // Delete source video from S3
+  if (session.video_s3_key) {
+    try {
+      const { DeleteObjectCommand } = require('@aws-sdk/client-s3');
+      await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: session.video_s3_key }));
+    } catch (s3Err) {
+      logger.error('match', 'S3 delete failed for session', s3Err);
+    }
+  }
+
+  // Delete any video_projects that used this video (also clean their output S3 objects)
+  const [vpRows] = await pool.query(
+    'SELECT output_s3_key FROM video_projects WHERE video_s3_key = ? AND user_id = ?',
+    [session.video_s3_key, req.user.userId]
+  );
+  for (const vp of vpRows) {
+    if (vp.output_s3_key) {
+      try {
+        const { DeleteObjectCommand } = require('@aws-sdk/client-s3');
+        await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: vp.output_s3_key }));
+      } catch { /* ignore */ }
+    }
+  }
+  await pool.query(
+    'DELETE FROM video_projects WHERE video_s3_key = ? AND user_id = ?',
+    [session.video_s3_key, req.user.userId]
+  );
+
+  await pool.query('DELETE FROM match_sessions WHERE id = ?', [session.id]);
+
+  res.json({ ok: true });
+}
+
+module.exports = { createMatchJob, streamMatchJob, listMatchSessions, getMatchSession, deleteMatchSession };
