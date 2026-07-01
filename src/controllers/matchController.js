@@ -9,7 +9,7 @@ const ALLOWED_VIDEO_MIME = ['video/mp4', 'video/webm', 'video/quicktime', 'video
 
 const uploadVideo = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 },
+  limits: { fileSize: 200 * 1024 * 1024 },
   fileFilter(_req, file, cb) {
     if (ALLOWED_VIDEO_MIME.includes(file.mimetype)) {
       cb(null, true);

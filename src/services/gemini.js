@@ -1,6 +1,37 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { GoogleAIFileManager } = require('@google/generative-ai/server');
 
+async function withRetry(fn, retries = 5, baseDelayMs = 2000) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const is503 = err.message && err.message.includes('503');
+      if (!is503 || attempt === retries) throw err;
+      const jitter = Math.random() * 1000;
+      const delay = baseDelayMs * Math.pow(2, attempt - 1) + jitter;
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
+const GENERATION_MODELS = ['gemini-2.5-flash-lite', 'gemini-2.0-flash-lite'];
+
+async function generateWithFallback(parts) {
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+  let lastErr;
+  for (const modelName of GENERATION_MODELS) {
+    try {
+      const model = genAI.getGenerativeModel({ model: modelName });
+      return await withRetry(() => model.generateContent(parts));
+    } catch (err) {
+      lastErr = err;
+      if (!err.message || !err.message.includes('503')) throw err;
+    }
+  }
+  throw lastErr;
+}
+
 const ANALYZE_PROMPT =
   'Watch this video carefully. Describe the mood, energy, emotional tone, pace, theme, atmosphere, and setting. ' +
   'What kind of music would complement this video perfectly? ' +
@@ -14,15 +45,12 @@ const AUDIO_PROMPT =
 async function analyzeVideo(videoBuffer, mimeType) {
   const fileManager = new GoogleAIFileManager(process.env.GEMINI_API_KEY);
 
-  // Upload video buffer to Gemini File API
-  const uploadResult = await fileManager.uploadFile(videoBuffer, {
-    mimeType,
-    displayName: 'video',
-  });
+  const uploadResult = await withRetry(() =>
+    fileManager.uploadFile(videoBuffer, { mimeType, displayName: 'video' })
+  );
 
   let file = uploadResult.file;
 
-  // Poll until Gemini finishes processing the video (state: ACTIVE)
   let polls = 0;
   while (file.state === 'PROCESSING') {
     if (polls >= 30) throw new Error('Video processing timed out after 60 seconds');
@@ -35,10 +63,7 @@ async function analyzeVideo(videoBuffer, mimeType) {
     throw new Error(`Video processing failed with state: ${file.state}`);
   }
 
-  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash-lite' });
-
-  const result = await model.generateContent([
+  const result = await generateWithFallback([
     { fileData: { mimeType, fileUri: file.uri } },
     { text: ANALYZE_PROMPT },
   ]);
@@ -50,20 +75,21 @@ async function embedText(text) {
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
   const model = genAI.getGenerativeModel({ model: 'gemini-embedding-2' });
 
-  const result = await model.embedContent({
-    content: { parts: [{ text }], role: 'user' },
-    outputDimensionality: 768,
-  });
+  const result = await withRetry(() =>
+    model.embedContent({
+      content: { parts: [{ text }], role: 'user' },
+      outputDimensionality: 768,
+    })
+  );
   return result.embedding.values;
 }
 
 async function analyzeAudio(audioBuffer, mimeType) {
   const fileManager = new GoogleAIFileManager(process.env.GEMINI_API_KEY);
 
-  const uploadResult = await fileManager.uploadFile(audioBuffer, {
-    mimeType,
-    displayName: 'audio',
-  });
+  const uploadResult = await withRetry(() =>
+    fileManager.uploadFile(audioBuffer, { mimeType, displayName: 'audio' })
+  );
 
   let file = uploadResult.file;
 
@@ -79,10 +105,7 @@ async function analyzeAudio(audioBuffer, mimeType) {
     throw new Error(`Audio processing failed with state: ${file.state}`);
   }
 
-  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash-lite' });
-
-  const result = await model.generateContent([
+  const result = await generateWithFallback([
     { fileData: { mimeType, fileUri: file.uri } },
     { text: AUDIO_PROMPT },
   ]);
